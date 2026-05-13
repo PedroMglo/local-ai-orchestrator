@@ -1,6 +1,6 @@
 # PROJECT OVERVIEW — ai-orchestrator
 
-> **Versão:** 0.1.0
+> **Versão:** 0.4.0
 > **Última atualização:** 2026-05-12
 > **Linguagem:** Python ≥ 3.11
 > **Repositório:** `PedroMglo/local-ai-sys` · branch `dev-f2`
@@ -92,19 +92,22 @@ O `obsidian-rag` **não é modificado** — continua como serviço autónomo. O 
 
 ## 4. Arquitectura geral
 
-### Pipeline sequencial (Engine.run)
+### Pipeline (Engine.run)
 
 ```
 query
   │
-  ├─ HeuristicIntentClassifier     → Intent
-  ├─ HeuristicComplexityClassifier → Complexity
-  ├─ ConfigContextRouter           → [source names]
-  ├─ _gather_context()             → [ContextBlock, ...]
-  │    └─ (cada provider por ordem, com token budget)
-  ├─ ConfigModelRouter             → model name
-  ├─ _build_messages()             → [system, context, history, user]
-  └─ OllamaLLMClient.chat()        → response string
+  ├─ _classify_intent()               → Intent
+  │    ├─ HeuristicIntentClassifier    → Intent (rápido, sem I/O)
+  │    └─ _llm_intent_fallback()       → Intent? (se GENERAL + >5 palavras)
+  ├─ HeuristicComplexityClassifier    → Complexity
+  ├─ ConfigContextRouter             → [source names]
+  ├─ _gather_context()               → [ContextBlock, ...]
+  │    └─ ThreadPoolExecutor (v0.3)    → providers em paralelo
+  │       └─ timeout por provider (cfg.context.provider_timeout)
+  ├─ ConfigModelRouter               → model name
+  ├─ _build_messages()               → [system, context, history, user]
+  └─ OllamaLLMClient.chat()          → response string
 ```
 
 ### Estrutura de directórios
@@ -128,11 +131,12 @@ query
 │   │   ├── config_env.py       # ConfigEnvProvider
 │   │   └── logs.py             # LogsProvider
 │   ├── core/
-│   │   ├── engine.py           # Engine (orquestração principal)
-│   │   ├── intent.py           # HeuristicIntentClassifier
-│   │   ├── complexity.py       # HeuristicComplexityClassifier
-│   │   ├── model_router.py     # ConfigModelRouter
-│   │   └── context_router.py   # ConfigContextRouter
+   │   ├── engine.py           # Engine (orquestração principal + health_report + LLM fallback)
+   │   ├── intent.py           # HeuristicIntentClassifier
+   │   ├── complexity.py       # HeuristicComplexityClassifier
+   │   ├── model_router.py     # ConfigModelRouter
+   │   ├── context_router.py   # ConfigContextRouter
+   │   └── security.py         # safe_run() — wrapper whitelist para subprocess
 │   ├── llm/
 │   │   ├── base.py             # LLMClient Protocol
 │   │   └── ollama.py           # OllamaLLMClient
@@ -161,10 +165,10 @@ query
 
 ### Query completa (engine.run)
 
-1. **Classificação de intent** — `HeuristicIntentClassifier` analisa keywords PT+EN e identifica o tipo de pergunta (geral, notas locais, código, sistema, grafo, combinado).
+1. **Classificação de intent** — `Engine._classify_intent()` chama primeiro o `HeuristicIntentClassifier` com keywords PT+EN. Se o resultado é `GENERAL` e a query tem > 5 palavras, tenta `_llm_intent_fallback()` (modelo `fast`, timeout 3s). Em caso de falha do LLM, retorna `GENERAL` graciosamente.
 2. **Classificação de complexidade** — `HeuristicComplexityClassifier` avalia comprimento, sinais de raciocínio profundo e indicadores de código para escolher entre `simple/normal/complex/deep`.
 3. **Context routing** — `ConfigContextRouter` consulta uma tabela estática `intent → [providers]` e retorna a lista de fontes a activar.
-4. **Recolha de contexto** — `Engine._gather_context()` chama cada provider por ordem, respeitando o budget global de tokens (por defeito 6000). Providers falhos são ignorados sem falhar a query.
+4. **Recolha de contexto** — `Engine._gather_context()` executa todos os providers **em paralelo** via `ThreadPoolExecutor` (v0.3). Cada provider tem um timeout individual configurável (`context.provider_timeout`, default 10s). Resultados são reordenados pela prioridade original das `sources` e truncados ao budget global de tokens (default 6000). Providers que falham ou dão timeout são ignorados sem falhar a query.
 5. **Seleção de modelo** — `ConfigModelRouter` consulta a tabela `(intent, complexity) → model_key` e resolve para o nome de modelo configurado.
 6. **Construção de mensagens** — `_build_messages()` monta: system prompt PT-PT, context blocks (tagged), histórico de conversa (opcional), query do utilizador.
 7. **LLM call** — `OllamaLLMClient.chat()` chama `POST /api/chat` do Ollama com streaming opcional. Blocos `<think>` são removidos automaticamente.
@@ -203,6 +207,19 @@ Heurística keyword-based com sets PT+EN:
 - `_SYSTEM_FALSE_POSITIVES` — filtra "system design", "machine learning"
 
 Lógica de combinação: LOCAL + GRAPH → `LOCAL_AND_GRAPH`, SYSTEM + LOCAL → `SYSTEM_AND_LOCAL`.
+
+**LLM fallback (v0.2):** Quando a heurística retorna `GENERAL` e a query tem > 5 palavras, `Engine._classify_intent()` invoca `_llm_intent_fallback()` que chama o modelo `fast` (gemma3:4b) com timeout de 3s e parse via regex. O classifier em si mantém-se puro e sem dependências de I/O.
+
+### `orchestrator/core/security.py` — safe*run() *(novo em v0.2)\_
+
+Wrapper centralizado para execução de subprocessos:
+
+- Verifica `security.allowed_commands` antes de executar
+- Respeita `security.max_command_timeout` (default 5s)
+- `shell=False` explícito — sem expansão de shell
+- Captura `TimeoutExpired`, `FileNotFoundError`, `OSError` — retorna `""`
+
+Usado por `context/system.py` e `context/config_env.py`.
 
 ### `orchestrator/core/complexity.py` — ComplexityClassifier
 
@@ -262,7 +279,7 @@ Wire-up de todos os providers na ordem correcta. Ponto central de composição.
 
 **Circuit breaker** (RAGContextProvider): após 3 falhas consecutivas, RAG é ignorado por 60 segundos. Configurable via `orchestrator.toml [rag]`.
 
-**Budget**: cada provider recebe `budget_tokens = remaining` (token budget global menos o já consumido). Se o provider ultrapassar o budget, é truncado ou ignorado.
+**Budget**: cada provider recebe `budget_tokens = budget` (budget global total — v0.3 envia o budget total a todos em paralelo). Após recolha, os blocos são ordenados pela prioridade original de `sources` e truncados sequencialmente até esgotar o budget.
 
 ---
 
@@ -291,11 +308,16 @@ ai -m deep "analisa a arquitectura"
 
 Servidor FastAPI em `localhost:8585` (arranca com `orc serve`).
 
-| Endpoint    | Método | Body           | Descrição                                                 |
-| ----------- | ------ | -------------- | --------------------------------------------------------- |
-| `/query`    | POST   | `QueryRequest` | Query completa com routing. Suporta `stream: true` (SSE). |
-| `/classify` | POST   | `QueryRequest` | Classificação sem LLM. Retorna `intent` + `complexity`.   |
-| `/health`   | GET    | —              | Estado de Ollama, RAG e todos os providers.               |
+| Endpoint    | Método | Body           | Descrição                                                               |
+| ----------- | ------ | -------------- | ----------------------------------------------------------------------- |
+| `/query`    | POST   | `QueryRequest` | Query completa com routing. Suporta `stream: true` (SSE). Rate-limited. |
+| `/classify` | POST   | `QueryRequest` | Classificação sem LLM. Retorna `intent` + `complexity`. Sem rate limit. |
+| `/health`   | GET    | —              | Estado de Ollama, RAG e todos os providers. Sem rate limit.             |
+| `/metrics`  | GET    | `?window=300`  | Latências, distribuições intent/model, p95. Sem rate limit. (v0.4)      |
+
+**Rate limiting (v0.3):** O endpoint `/query` é protegido por `asyncio.Semaphore(max_concurrent_llm)` — default 1 slot (Ollama processa 1 request em GPU de cada vez). Se todas as slots estão ocupadas, retorna HTTP 429 com header `Retry-After: 5`.
+
+**Autenticação (v0.4):** Middleware HTTP valida API key via `X-API-Key` ou `Authorization: Bearer <key>`. Desactivada por defeito (`api_key = ""`). Paths isentos: `/health`, `/metrics`, `/docs`.
 
 ### QueryRequest
 
@@ -304,7 +326,8 @@ Servidor FastAPI em `localhost:8585` (arranca com `orc serve`).
   "query": "string",
   "model": "string | null",
   "stream": false,
-  "history": [{ "role": "user", "content": "..." }]
+  "history": [{ "role": "user", "content": "..." }],
+  "session_id": "string | null"
 }
 ```
 
@@ -318,7 +341,8 @@ Servidor FastAPI em `localhost:8585` (arranca com `orc serve`).
   "complexity": "normal",
   "sources_used": ["rag", "cag"],
   "context_tokens": 1240,
-  "latency_ms": 1823.4
+  "latency_ms": 1823.4,
+  "session_id": "uuid | null"
 }
 ```
 
@@ -333,6 +357,7 @@ orc ask "query..."                   # query completa
 orc ask -m qwen3:8b "..."            # override modelo
 orc ask --stream "..."               # streaming de tokens
 orc ask --debug "..."                # mostra intent/model/sources/latency em stderr
+orc ask --stream --debug "..."       # debug em stderr + stream em stdout (v0.4)
 orc ask --json-output "..."          # output JSON completo
 
 orc classify "query..."              # classificação sem LLM
@@ -372,6 +397,7 @@ echo "código" | ai "revê isto"       # stdin como contexto adicional
 [orchestrator]
 host = "127.0.0.1"
 port = 8585
+# api_key = ""               # API key authentication (v0.4, empty = disabled)
 
 [rag]
 url = "http://localhost:8484"
@@ -381,6 +407,7 @@ circuit_breaker_reset = 60
 
 [ollama]
 base_url = "http://localhost:11434"
+max_concurrent_llm = 1           # slots concorrentes para LLM (v0.3)
 
 [models]
 default = "qwen3:8b"
@@ -391,6 +418,7 @@ embedding = "bge-m3"
 
 [context]
 token_budget = 6000
+provider_timeout = 10              # timeout por provider em segundos (v0.3)
 
 [context.cag]
 db_path = "~/ai-local/obsidian-rag/data/qdrant/cag.db"
@@ -409,15 +437,27 @@ max_command_timeout = 5
 [logging]
 level = "INFO"
 format = "text"
+
+[session]
+enabled = false               # session store opt-in (v0.4)
+ttl_seconds = 3600
+max_messages = 20
+# db_path = ""               # default: ~/.local/share/ai-orchestrator/sessions.db
 ```
 
 ### Variáveis de ambiente (prefixo `ORC_`)
 
 ```bash
 ORC_ORCHESTRATOR_PORT=8585
+ORC_ORCHESTRATOR_API_KEY=          # API key (v0.4, empty = disabled)
 ORC_RAG_URL=http://localhost:8484
 ORC_MODELS_DEFAULT=qwen3:8b
 ORC_CONTEXT_TOKEN_BUDGET=8000
+ORC_CONTEXT_PROVIDER_TIMEOUT=10
+ORC_OLLAMA_MAX_CONCURRENT_LLM=1
+ORC_SESSION_ENABLED=false          # session store (v0.4)
+ORC_SESSION_TTL_SECONDS=3600
+ORC_SESSION_MAX_MESSAGES=20
 ```
 
 ---
@@ -470,6 +510,8 @@ pytest tests/ -v -m integration
 | `test_integration.py`    | 18      | integração |
 | **Total**                | **102** |            |
 
+**Coverage actual (unitários):** 71% — gerado automaticamente em cada `pytest` via `--cov=orchestrator --cov-report=term-missing`.
+
 ---
 
 ## 15. Dependências
@@ -489,7 +531,7 @@ pytest tests/ -v -m integration
 
 ### Stdlib utilizada
 
-`tomllib`, `sqlite3`, `subprocess`, `pathlib`, `dataclasses`, `enum`, `typing`, `logging`, `time`, `json`, `re`
+`tomllib`, `sqlite3`, `subprocess`, `pathlib`, `dataclasses`, `enum`, `typing`, `logging`, `time`, `json`, `re`, `concurrent.futures`, `asyncio`, `uuid`, `secrets`, `statistics`, `collections`
 
 ---
 
@@ -528,19 +570,23 @@ ai "olá"
 
 ## 17. Estado actual
 
-| Fase                  | Estado | Descrição                                                   |
-| --------------------- | ------ | ----------------------------------------------------------- |
-| 0 — Scaffolding       | ✅     | Estrutura, configs, pyproject.toml                          |
-| 1 — Core              | ✅     | Intent, Complexity, ModelRouter, ContextRouter, Engine, LLM |
-| 2 — Context Providers | ✅     | 7 providers implementados e testados                        |
-| 3 — API + CLI         | ✅     | FastAPI :8585, `orc` CLI completo                           |
-| 4 — Shell integration | ✅     | `ai` com fallback 3 níveis, `--debug`, `--classify`         |
-| 5 — Hardening         | ✅     | Circuit breaker, testes integração, documentação            |
+| Fase                       | Estado | Descrição                                                   |
+| -------------------------- | ------ | ----------------------------------------------------------- |
+| 0 — Scaffolding            | ✅     | Estrutura, configs, pyproject.toml                          |
+| 1 — Core                   | ✅     | Intent, Complexity, ModelRouter, ContextRouter, Engine, LLM |
+| 2 — Context Providers      | ✅     | 7 providers implementados e testados                        |
+| 3 — API + CLI              | ✅     | FastAPI :8585, `orc` CLI completo                           |
+| 4 — Shell integration      | ✅     | `ai` com fallback 3 níveis, `--debug`, `--classify`         |
+| 5 — Hardening              | ✅     | Circuit breaker, testes integração, documentação            |
+| 6 — Robustez (v0.2)        | ✅     | LLM fallback intent, `health_report()`, `safe_run()`, CI    |
+| 7 — Performance (v0.3)     | ✅     | Gather paralelo, timeout por provider, rate limiting LLM    |
+| 8 — Funcionalidades (v0.4) | ✅     | Session store, API auth, `--stream --debug`, `/metrics`     |
 
-**Próximos passos candidatos:**
+**Versão actual: 0.4.0**
 
-- LLM fallback para classificação de intent (queries ambíguas)
-- Métricas de latência persistentes (`/metrics` endpoint)
-- Agentes com tool calling (ReAct loop)
-- Suporte a múltiplos backends LLM (vLLM, LM Studio)
-- Context providers adicionais (calendário, e-mail local, RSS)
+**Próximos passos candidatos (v1.0):**
+
+- `Engine.run_agentic()` com ReAct loop e tool calling
+- Tool definitions para cada ContextProvider
+- Suporte a backends LLM alternativos (OpenAI-compatible)
+- Context providers adicionais (calendário, RSS, e-mail local)
