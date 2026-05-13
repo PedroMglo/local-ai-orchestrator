@@ -1,0 +1,72 @@
+# AI Orchestrator — Configuração
+# Override com env vars prefixadas com ORC_
+# Ex: ORC_ORCHESTRATOR_PORT=8585
+
+[orchestrator]
+host = "127.0.0.1"
+port = 8585
+# API key authentication (empty = disabled, any process can query)
+# Set via env var ORC_ORCHESTRATOR_API_KEY or in ~/ai-local/.env
+# api_key = ""
+
+[rag]
+url = "http://localhost:8484"
+timeout = 30
+health_interval = 30
+# Circuit breaker: falhas consecutivas antes de skip
+circuit_breaker_threshold = 3
+# Segundos para manter circuit breaker aberto
+circuit_breaker_reset = 60
+
+[ollama]
+base_url = "http://localhost:11434"
+# Max concurrent LLM requests (Ollama processes 1 at a time on GPU)
+max_concurrent_llm = 1
+
+[models]
+default = "qwen3:8b"
+fast = "gemma3:4b"
+code = "qwen2.5-coder:7b"
+deep = "deepseek-r1:8b"
+embedding = "bge-m3"
+
+[context]
+token_budget = 6000
+# Timeout per context provider in seconds (parallel gather)
+provider_timeout = 10
+
+[context.cag]
+db_path = "~/ai-local/obsidian-rag/data/qdrant/cag.db"
+
+[repos]
+paths = [
+    "~/ai-local/SPEECH-LAB",
+    "~/Projects/ApacheSpark-CD",
+    "~/ai-local/obsidian-rag",
+    "~/Projects/Git_Concepts",
+    "~/Projects/Python_Stud",
+]
+
+[graph]
+output_dir = "~/ai-local/obsidian-rag/data/graphify"
+cache_ttl = 300
+
+[security]
+allowed_commands = [
+    "free", "nvidia-smi", "df", "ps", "uptime", "nproc",
+    "uname", "ip", "sensors", "git", "ollama", "docker",
+    "cat", "wc", "head", "tail",
+]
+max_command_timeout = 5
+
+[logging]
+level = "INFO"
+format = "text"
+
+[session]
+# Session store for conversation continuity (opt-in)
+enabled = true
+ttl_seconds = 3600
+db_path = "/home/pmglourenco/ai-local/orchestrator/orchestrator/sessions.db"  # Path para SQLite
+
+max_messages = 20
